@@ -162,7 +162,7 @@ class ContextManager:
         messages_to_summarize.append(
             Message(
                 role="user",
-                content="Please provide a concise summary of the conversation above, focusing on key decisions, code changes, problems solved, and important context needed for future turns.",
+                content="Please provide a concise summary of the conversation above, focusing on key decisions, the 'why' behind the decisions, problems solved, and important context needed for developing further. Your summary will be given to someone who has never worked on this project before and they will be have to be filled in.",
             )
         )
 

@@ -340,22 +340,6 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
           )}
         </Box>
 
-        <Box
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 0.5,
-          }}
-        >
-          <StatusDot connected={isConnected} />
-          <Typography
-            variant="caption"
-            sx={{ color: 'var(--muted-text)', fontSize: '0.62rem', letterSpacing: '0.02em' }}
-          >
-            {sessions.length} session{sessions.length !== 1 ? 's' : ''} &middot; Backend {isConnected ? 'online' : 'offline'}
-          </Typography>
-        </Box>
       </Box>
     </Box>
   );
