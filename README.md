@@ -7,8 +7,8 @@ An MLE agent that researches, writes, and ships good quality ML releated code us
 ### Installation
 
 ```bash
-git clone git@github.com:huggingface/hf_agent.git
-cd hf_agent
+git clone git@github.com:huggingface/ml-agent.git
+cd ml-agent
 uv sync
 uv tool install -e .
 ```
