@@ -21,14 +21,15 @@ from typing import Optional
 # whose value is a JSON dict (same shape, overrides hard-coded entries).
 @dataclass
 class LocalProvider:
-    api_base: str        # e.g. "http://localhost:11434"
+    api_base: str        # e.g. "http://localhost:11434/v1"
     api_key: Optional[str]  # None = no auth header
+    protocol: str = "openai"  # "openai" | "anthropic"
 
 
 _LOCAL_PROVIDER_REGISTRY: dict[str, LocalProvider] = {
     # Ollama: runs locally at localhost:11434, no API key needed by default.
     # Use the model name as it appears in `ollama list`, e.g. "ollama/llama3.2".
-    "ollama": LocalProvider(api_base="http://localhost:11434", api_key=None),
+    "ollama": LocalProvider(api_base="http://localhost:11434/v1", api_key=None),
 
     # LM Studio: OpenAI-compatible server on localhost.
     "lmstudio": LocalProvider(api_base="http://localhost:1234/v1", api_key="not-needed"),
@@ -40,12 +41,14 @@ _LOCAL_PROVIDER_REGISTRY: dict[str, LocalProvider] = {
     "minimax": LocalProvider(
         api_base="https://api.minimax.io/anthropic",
         api_key=os.environ.get("MINIMAX_API_KEY"),
+        protocol="anthropic",
     ),
 
     # Z.ai: direct Anthropic-compatible endpoint (set ZAI_API_KEY env var).
     "zai": LocalProvider(
         api_base="https://api.z.ai/anthropic/v1",
         api_key=os.environ.get("ZAI_API_KEY"),
+        protocol="anthropic",
     ),
 }
 
@@ -59,6 +62,7 @@ if _env_providers_raw:
             _LOCAL_PROVIDER_REGISTRY[prefix.lower()] = LocalProvider(
                 api_base=cfg["api_base"],
                 api_key=cfg.get("api_key"),
+                protocol=cfg.get("protocol", "openai"),
             )
     except Exception as e:
         import warnings
@@ -75,11 +79,19 @@ _PROVIDER_OVERRIDES: dict[str, tuple[str, str]] = {
     "zai-org/": ("https://api.z.ai/anthropic/v1", "zai"),
 }
 
-# Resolve per-model API key from env vars at module load time
-_PROVIDER_KEYS: dict[str, str] = {
-    "minimax": os.environ.get("MINIMAX_API_KEY", ""),
-    "zai": os.environ.get("ZAI_API_KEY", ""),
+# Provider key env vars. Values are read dynamically at request-time so users
+# can export keys after process startup and still switch models without restart.
+_PROVIDER_KEY_ENV: dict[str, str] = {
+    "minimax": "MINIMAX_API_KEY",
+    "zai": "ZAI_API_KEY",
 }
+
+
+def _get_provider_key(provider_key: str) -> str:
+    env_name = _PROVIDER_KEY_ENV.get(provider_key)
+    if not env_name:
+        return ""
+    return os.environ.get(env_name, "")
 
 
 # HF router reasoning models only accept "low" | "medium" | "high" (e.g.
@@ -104,10 +116,11 @@ def _resolve_llm_params(
       extended-thinking models accept "low" | "medium" | "high" and LiteLLM
       translates to the thinking config).
 
-    • ``ollama/<model>``, ``lmstudio/<model>``, ``jan/<model>`` — any entry in
-      ``_LOCAL_PROVIDER_REGISTRY`` is called via the OpenAI-compatible adapter
-      pointed at the provider's local server (no API key needed by default).
-      The model name is forwarded as-is so it matches what the server expects.
+    • ``ollama/<model>``, ``lmstudio/<model>``, ``jan/<model>``,
+      ``minimax/<model>``, ``zai/<model>`` — any entry in
+      ``_LOCAL_PROVIDER_REGISTRY`` is called via the OpenAI/Anthropic-compatible
+      adapter configured for that provider. The model name is forwarded as-is so
+      it matches what the server expects.
 
     • Anything else is treated as a HuggingFace router id. We hit the
       auto-routing OpenAI-compatible endpoint at
@@ -135,7 +148,7 @@ def _resolve_llm_params(
     for model_prefix, (api_base, prov_key) in _PROVIDER_OVERRIDES.items():
         stripped = model_name.removeprefix("huggingface/")
         if stripped.startswith(model_prefix):
-            api_key = _PROVIDER_KEYS.get(prov_key, "")
+            api_key = _get_provider_key(prov_key)
             params: dict = {
                 "model": f"anthropic/{stripped}",
                 "api_base": api_base,
@@ -160,11 +173,17 @@ def _resolve_llm_params(
         if model_name.lower().startswith(prefix + "/"):
             # Strip the prefix; what remains is the model name the server expects
             bare_model = model_name[len(prefix) + 1:]
+            model_prefix = "anthropic" if provider.protocol == "anthropic" else "openai"
             params: dict = {
-                "model": bare_model,
+                "model": f"{model_prefix}/{bare_model}",
                 "api_base": provider.api_base,
             }
-            if provider.api_key:
+            # Prefer dynamic env lookup for providers with dedicated key vars,
+            # fallback to static api_key from registry for custom providers.
+            dynamic_key = _get_provider_key(prefix)
+            if dynamic_key:
+                params["api_key"] = dynamic_key
+            elif provider.api_key:
                 params["api_key"] = provider.api_key
             return params
 

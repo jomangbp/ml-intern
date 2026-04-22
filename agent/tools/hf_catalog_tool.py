@@ -9,7 +9,6 @@ This enables dynamic model selection — the agent can say "use the cheapest
 live model with tool support" and actually do it.
 """
 
-import json
 from typing import Any
 
 import httpx

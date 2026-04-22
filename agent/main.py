@@ -123,7 +123,12 @@ def _print_model_preflight(model_id: str, console) -> None:
     still allow the switch (the catalog might be lagging).
     """
     from agent.core import hf_router_catalog as cat
-    from agent.core.llm_params import _LOCAL_PROVIDER_REGISTRY, _PROVIDER_OVERRIDES, _PROVIDER_KEYS
+    from agent.core.llm_params import (
+        _LOCAL_PROVIDER_REGISTRY,
+        _PROVIDER_OVERRIDES,
+        _PROVIDER_KEY_ENV,
+        _get_provider_key,
+    )
 
     if model_id.startswith(("anthropic/", "openai/")):
         console.print(f"[green]Model switched to {model_id}[/green]")
@@ -133,7 +138,7 @@ def _print_model_preflight(model_id: str, console) -> None:
     for model_prefix, (api_base, prov_key) in _PROVIDER_OVERRIDES.items():
         stripped = model_id.removeprefix("huggingface/")
         if stripped.startswith(model_prefix):
-            api_key = _PROVIDER_KEYS.get(prov_key, "")
+            api_key = _get_provider_key(prov_key)
             key_status = "✅ set" if api_key else "⚠️  NOT SET"
             console.print(f"[green]Model switched to {model_id}[/green]")
             console.print(
@@ -144,7 +149,7 @@ def _print_model_preflight(model_id: str, console) -> None:
             )
             if not api_key:
                 console.print(
-                    f"  [bold yellow]⚠️  Set {prov_key.upper()}_API_KEY to authenticate.[/bold yellow]"
+                    f"  [bold yellow]⚠️  Set {_PROVIDER_KEY_ENV.get(prov_key, prov_key.upper() + '_API_KEY')} to authenticate.[/bold yellow]"
                 )
             return
 
@@ -903,7 +908,9 @@ def _handle_slash_command(
             console.print(
                 "\n[dim]Paste any HF model id (e.g. 'MiniMaxAI/MiniMax-M2.7').\n"
                 "Add ':fastest', ':cheapest', ':preferred', or ':<provider>' to override routing.\n"
-                "Use 'anthropic/<model>' or 'openai/<model>' for direct API access.[/dim]"
+                "Use 'anthropic/<model>' or 'openai/<model>' for direct API access.\n"
+                "Local/direct models: 'ollama/<name>', 'lmstudio/<name>', 'jan/<name>',\n"
+                "'minimax/<name>' (MINIMAX_API_KEY), 'zai/<name>' (ZAI_API_KEY).[/dim]"
             )
             return None
         if not _is_valid_model_id(arg):
@@ -912,7 +919,9 @@ def _handle_slash_command(
                 "[dim]Expected:\n"
                 "  • <org>/<model>[:tag]    (HF router — paste from huggingface.co)\n"
                 "  • anthropic/<model>\n"
-                "  • openai/<model>[/dim]"
+                "  • openai/<model>\n"
+                "  • ollama/<model> | lmstudio/<model> | jan/<model>\n"
+                "  • minimax/<model> | zai/<model>[/dim]"
             )
             return None
         normalized = arg.removeprefix("huggingface/")

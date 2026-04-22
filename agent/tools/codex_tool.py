@@ -15,11 +15,8 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
-
-from agent.tools.types import ToolResult
+from typing import Any, Callable, Union
 
 # ── Config paths Codex uses ────────────────────────────────────────────
 
@@ -83,78 +80,79 @@ async def codex_login_handler(arguments: dict[str, Any]) -> tuple[str, bool]:
                 True,
             )
 
-    # 3. Detect terminal capability for device code auth
-    #    Codex uses a localhost redirect for OAuth; if we can't handle that,
-    #    we fall back to instructing the user.
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-    # 4. Attempt device code flow in a subprocess
-    #    Codex --device-auth opens no browser — it prints a URL + code.
-    tmp_code: list[str] = [""]
-
-    def _capture_device_code(line: str) -> None:
-        m = re.search(r"(https?://[^\s]+)\s+with\s+code\s+([A-Z0-9]+)", line)
-        if m:
-            tmp_code[0] = f"URL: {m.group(1)}\nCode: {m.group(2)}"
-        elif "successfully" in line.lower() or "logged in" in line.lower():
-            tmp_code[0] = "SUCCESS"
-
+    # 3. Attempt device-code flow in a subprocess. Codex prints a URL + code,
+    # then waits for browser completion. We capture the prompt and timeout early.
+    login_status: list[str] = [""]
     print_url: list[str] = [""]
-
-    def _capture_url(line: str) -> None:
-        if line.startswith("http"):
-            print_url[0] = line.strip()
-
+    device_code: list[str] = [""]
     output_lines: list[str] = []
-    has_codex_com = False
+    has_openai_auth_url: list[bool] = [False]
+
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
     def _collect(line: str) -> None:
-        output_lines.append(line)
-        if "codex.ai" in line or "platform.openai.com" in line:
-            has_codex_com = True
-        _capture_device_code(line)
-        _capture_url(line)
+        clean = ansi_re.sub("", line).strip()
+        if not clean:
+            return
+        output_lines.append(clean)
+
+        lower = clean.lower()
+        if "successfully" in lower or "logged in" in lower:
+            login_status[0] = "SUCCESS"
+
+        url_match = re.search(r"https?://\S+", clean)
+        if url_match:
+            url = url_match.group(0)
+            if "auth.openai.com" in url or "openai.com" in url:
+                has_openai_auth_url[0] = True
+            print_url[0] = url
+
+        code_match = re.search(r"\b[A-Z0-9]{4,}-[A-Z0-9]{4,}\b", clean)
+        if code_match:
+            device_code[0] = code_match.group(0)
 
     try:
-        result = _run_codex_command(
+        _run_codex_command(
             ["login", "--device-auth", "--verbose"],
             on_line=_collect,
-            timeout=60,
+            timeout=20,
         )
     except Exception as e:
         return f"Failed to run `codex login --device-auth`: {e}", False
 
-    # 5. Parse result
-    if tmp_code[0] == "SUCCESS":
+    # 4. Parse result
+    if login_status[0] == "SUCCESS":
         username = _detect_codex_user(codex_path)
         return f"Codex login successful. User: {username or 'unknown'}", True
 
-    if print_url[0]:
-        # Device code URL was printed — surface it to the agent
+    if print_url[0] or device_code[0]:
+        code_block = f"\nCode:\n  {device_code[0]}\n" if device_code[0] else ""
         return (
-            f"Codex device code flow started.\n\n"
-            f"Open this URL in your browser:\n  {print_url[0]}\n\n"
-            f"Complete the sign-in there, then this tool will detect the session.\n"
-            f"Or run `codex login --device-auth` manually in a terminal first.",
+            "Codex device code flow started.\n\n"
+            f"Open this URL in your browser:\n  {print_url[0] or 'https://auth.openai.com/codex/device'}\n"
+            f"{code_block}\n"
+            "Complete sign-in, then run this tool again to confirm authentication.\n"
+            "(You can also run `codex login --device-auth` manually in your terminal.)",
             True,
         )
 
-    # 6. Fallback: check if it opened a browser automatically
-    if has_codex_com:
+    # 5. Fallback: check if browser/OAuth path was initiated
+    if has_openai_auth_url[0]:
         return (
-            "Codex browser-based login was initiated.\n\n"
-            "Complete the sign-in in the opened browser, then run this tool again "
-            "to confirm authentication.",
+            "Codex browser/device login was initiated.\n\n"
+            "Complete sign-in in your browser, then run this tool again to confirm.",
             True,
         )
 
+    tail = "\n".join(output_lines[-6:]) if output_lines else "(no output captured)"
     return (
         "Could not determine Codex login state automatically.\n\n"
         "Manual steps:\n"
         "1. Run in a terminal: `codex login --device-auth`\n"
         "2. Open the URL it prints, sign in with ChatGPT or API key\n"
         "3. Retry this tool\n\n"
-        f"Codex binary: {codex_path}",
+        f"Codex binary: {codex_path}\n"
+        f"Last CLI output:\n{tail}",
         True,  # not an error — just needs manual step
     )
 
@@ -201,8 +199,13 @@ def _run_codex_command(
                 on_line(line.rstrip("\n"))
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # Expected for device-code flow (Codex waits for user browser auth).
             proc.kill()
-            raise
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return subprocess.CompletedProcess(proc.args, 124)
         return subprocess.CompletedProcess(proc.args, proc.returncode)
 
     result = subprocess.run(
