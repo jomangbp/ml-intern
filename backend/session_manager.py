@@ -172,8 +172,11 @@ class SessionManager:
         def _create_session_sync():
             t0 = _time.monotonic()
             tool_router = ToolRouter(self.config.mcpServers, hf_token=hf_token)
+            # Deep-copy config so each session's model switches independently —
+            # tab A picking GLM doesn't flip tab B off Claude.
+            session_config = self.config.model_copy(deep=True)
             session = Session(
-                event_queue, config=self.config, tool_router=tool_router,
+                event_queue, config=session_config, tool_router=tool_router,
                 hf_token=hf_token,
             )
             t1 = _time.monotonic()
@@ -424,6 +427,7 @@ class SessionManager:
             "message_count": len(agent_session.session.context_manager.items),
             "user_id": agent_session.user_id,
             "pending_approval": pending_approval,
+            "model": agent_session.session.config.model_name,
         }
 
     def list_sessions(self, user_id: str | None = None) -> list[dict[str, Any]]:

@@ -237,6 +237,33 @@ async def get_session(
     return SessionInfo(**info)
 
 
+@router.post("/session/{session_id}/model")
+async def set_session_model(
+    session_id: str, body: dict, user: dict = Depends(get_current_user)
+) -> dict:
+    """Switch the active model for a single session (tab-scoped).
+
+    Takes effect on the next LLM call in that session — other sessions
+    (including other browser tabs) are unaffected.
+    """
+    _check_session_access(session_id, user)
+    model_id = body.get("model")
+    if not model_id:
+        raise HTTPException(status_code=400, detail="Missing 'model' field")
+    valid_ids = {m["id"] for m in AVAILABLE_MODELS}
+    if model_id not in valid_ids:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
+    agent_session = session_manager.sessions.get(session_id)
+    if not agent_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    agent_session.session.update_model(model_id)
+    logger.info(
+        f"Session {session_id} model → {model_id} "
+        f"(by {user.get('username', 'unknown')})"
+    )
+    return {"session_id": session_id, "model": model_id}
+
+
 @router.get("/sessions", response_model=list[SessionInfo])
 async def list_sessions(user: dict = Depends(get_current_user)) -> list[SessionInfo]:
     """List sessions belonging to the authenticated user."""

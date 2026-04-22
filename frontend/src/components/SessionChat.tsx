@@ -105,6 +105,7 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
         onEditAndRegenerate={editAndRegenerate}
       />
       <ChatInput
+        sessionId={sessionId}
         onSend={handleSendMessage}
         onStop={handleStop}
         isProcessing={busy}
