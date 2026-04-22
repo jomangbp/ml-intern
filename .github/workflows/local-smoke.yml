@@ -1,0 +1,50 @@
+name: local-smoke
+
+on:
+  push:
+    branches: [main, feat/ml-intern-extensions]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install deps
+        run: uv sync
+
+      - name: Syntax check
+        run: |
+          uv run python -m py_compile \
+            agent/core/llm_params.py \
+            agent/core/tools.py \
+            agent/main.py \
+            agent/tools/codex_tool.py \
+            agent/tools/hf_catalog_tool.py
+
+      - name: Tool registry check
+        run: uv run python scripts/check_tool_registry.py
+
+      - name: Tiny-transformer CPU smoke (numpy)
+        run: uv run python scripts/smoke_tiny_transformer_numpy.py
+
+      - name: Optional E2E tiny transformer via ml-intern
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+        run: |
+          if [ -z "$MINIMAX_API_KEY" ]; then
+            echo "MINIMAX_API_KEY not configured; skipping optional E2E."
+            exit 0
+          fi
+          uv tool install -e .
+          scripts/e2e_tiny_transformer.sh
