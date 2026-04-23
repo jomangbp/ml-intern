@@ -14,6 +14,7 @@ from litellm.exceptions import ContextWindowExceededError
 from agent.config import Config
 from agent.core.doom_loop import check_for_doom_loop
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import Event, OpType, Session
 from agent.core.tools import ToolRouter
 from agent.tools.jobs_tool import CPU_FLAVORS
@@ -244,6 +245,8 @@ class LLMResult:
 async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> LLMResult:
     """Call the LLM with streaming, emitting assistant_chunk events."""
     response = None
+    _healed_effort = False  # one-shot safety net per call
+    messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         try:
             response = await acompletion(
@@ -329,6 +332,8 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
 async def _call_llm_non_streaming(session: Session, messages, tools, llm_params) -> LLMResult:
     """Call the LLM without streaming, emit assistant_message at the end."""
     response = None
+    _healed_effort = False
+    messages, tools = with_prompt_caching(messages, tools, llm_params.get("model"))
     for _llm_attempt in range(_MAX_LLM_RETRIES):
         try:
             response = await acompletion(

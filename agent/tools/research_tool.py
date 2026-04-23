@@ -15,6 +15,7 @@ from litellm import Message, acompletion
 
 from agent.core.doom_loop import check_for_doom_loop
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import Event
 
 logger = logging.getLogger(__name__)
@@ -318,8 +319,9 @@ async def research_handler(
                 ),
             ))
             try:
+                _msgs, _ = with_prompt_caching(messages, None, llm_params.get("model"))
                 response = await acompletion(
-                    messages=messages,
+                    messages=_msgs,
                     tools=None,  # no tools — force text response
                     stream=False,
                     timeout=120,
@@ -343,9 +345,12 @@ async def research_handler(
             ))
 
         try:
+            _msgs, _tools = with_prompt_caching(
+                messages, tool_specs if tool_specs else None, llm_params.get("model")
+            )
             response = await acompletion(
-                messages=messages,
-                tools=tool_specs if tool_specs else None,
+                messages=_msgs,
+                tools=_tools,
                 tool_choice="auto",
                 stream=False,
                 timeout=120,
@@ -441,8 +446,9 @@ async def research_handler(
         ),
     ))
     try:
+        _msgs, _ = with_prompt_caching(messages, None, llm_params.get("model"))
         response = await acompletion(
-            messages=messages,
+            messages=_msgs,
             tools=None,
             stream=False,
             timeout=120,
