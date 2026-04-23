@@ -291,6 +291,10 @@ def _resolve_llm_params(
         return params
 
 
+    if model_name.startswith("bedrock/"):
+        # Route directly through LiteLLM Bedrock adapter (AWS creds from env).
+        return {"model": model_name}
+
     # Check local provider registry (case-insensitive)
     for prefix, provider in _LOCAL_PROVIDER_REGISTRY.items():
         if model_name.lower().startswith(prefix + "/"):
