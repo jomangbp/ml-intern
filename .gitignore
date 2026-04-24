@@ -71,4 +71,13 @@ models/
 checkpoint-*/
 runs/
 wandb/
+backend/hybrid-slm/outputs/
+backend/hybrid-slm/data/
+training.log
+
+# Local app state (outside repository code)
+.ml-intern/
+
+# Frontend build cache
 frontend/tsconfig.tsbuildinfo
+static/assets/index-*.js
