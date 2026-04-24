@@ -23,19 +23,40 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Compose review prompt
+        id: compose
+        run: |
+          {
+            printf 'prompt<<PROMPT_EOF\n'
+            if [ -f REVIEW.md ]; then
+              echo '# Highest-priority review instructions (from REVIEW.md at the repo root)'
+              echo 'Follow these rules as the authoritative guide for this review. If anything'
+              echo 'below contradicts a more generic review habit, follow these.'
+              echo
+              cat REVIEW.md
+              echo
+              echo '---'
+              echo
+            fi
+            cat <<'BASE'
+          Review this pull request against the main branch.
+
+          Tag every finding with a priority label: P0 (blocks merge), P1 (worth
+          fixing, not blocking), or P2 (informational / pre-existing). Open the
+          review body with a one-line tally ("2 P0, 3 P1", or
+          "No blocking issues — 3 P1", or "LGTM" if nothing). Cite file:line for
+          every behavior claim. Prefer inline comments over long summaries.
+
+          Fallback focus if REVIEW.md is missing: correctness, security (auth,
+          injection, SSRF), LiteLLM/Bedrock routing breakage, agent loop / streaming
+          regressions, test coverage for new behavior. Skip anything ruff already
+          catches.
+          BASE
+            printf 'PROMPT_EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           track_progress: true
-          prompt: |
-            Review this pull request against the main branch. Focus on:
-            - Correctness and likely bugs
-            - Security issues (auth, input validation, secrets, injection)
-            - Performance regressions, especially in the agent loop and streaming paths
-            - Breakages in LiteLLM / Bedrock routing (model ids, params, prompt caching)
-            - Test coverage for new behavior
-            - Backend/frontend contract drift (FastAPI routes ↔ React client)
-
-            Be concise. Prefer inline comments over long summaries. Skip nitpicks on
-            style that ruff already catches. If the PR looks good, say so briefly
-            instead of inventing issues.
+          prompt: ${{ steps.compose.outputs.prompt }}
