@@ -2,17 +2,22 @@
   <img src="frontend/public/smolagents.webp" alt="smolagents logo" width="160" />
 </p>
 
-# ML Intern
+# ML Intern Local
 
-An ML intern that autonomously researches, writes, and ships good quality ML releated code using the Hugging Face ecosystem — with deep access to docs, papers, datasets, and cloud compute.
+Local-first ML Intern fork with persistent user workspace settings and multi-provider support. It can autonomously research, write, and ship ML code, with built-in support for:
+
+- **Codex OAuth** (ChatGPT/Codex-backed GPT-5 models)
+- **MiniMax provider**
+- **Z.AI provider**
+- Hugging Face router/models and local execution tools
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-git clone git@github.com:huggingface/ml-intern.git
-cd ml-intern
+git clone git@github.com:jomangbp/ml-intern-local.git
+cd ml-intern-local
 uv sync
 uv tool install -e .
 ```
@@ -27,10 +32,15 @@ Create a `.env` file in the project root (or export these in your shell):
 
 ```bash
 ANTHROPIC_API_KEY=<your-anthropic-api-key> # if using anthropic models
+OPENAI_API_KEY=<your-openai-api-key>         # optional, if not using Codex OAuth
+MINIMAX_API_KEY=<your-minimax-key>           # optional (can also be set in UI)
+ZAI_API_KEY=<your-zai-key>                   # optional (can also be set in UI)
 HF_TOKEN=<your-hugging-face-token>
 GITHUB_TOKEN=<github-personal-access-token> 
 ```
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
+
+When you save provider keys from the UI settings, this local fork persists them in a per-user workspace `.env` file so they survive restarts.
 
 ### Usage
 
