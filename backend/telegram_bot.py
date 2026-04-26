@@ -628,7 +628,7 @@ class TelegramBotService:
                 if update.get("_ping"):
                     self._ping_count = getattr(self, '_ping_count', 0) + 1
                     if self._ping_count % 10 == 1:
-                        logger.info("TG poll alive (ping #%d)", self._ping_count)
+                        logger.debug("TG poll alive (ping #%d)", self._ping_count)
                     continue  # heartbeat
                 if update.get("_error"):
                     logger.warning("TG poll subprocess error: %s", update["_error"])
@@ -661,7 +661,7 @@ class TelegramBotService:
         while self._running:
             poll_count += 1
             self._poll_count = poll_count
-            if poll_count <= 10 or poll_count % 60 == 0:
+            if poll_count <= 3 or poll_count % 100 == 0:
                 logger.info("TG poll #%d (offset=%d)", poll_count, self._offset)
             try:
                 payload = _json.dumps({"offset": self._offset, "timeout": 3, "allowed_updates": ["message", "callback_query"]}).encode()
@@ -761,7 +761,7 @@ class TelegramBotService:
     # ── Message routing ───────────────────────────────────────────
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
-        logger.info("TG update received: %s", list(update.keys()))
+        logger.debug("TG update received: %s", list(update.keys()))
         # Extract user info from either message or callback_query
         user_id = None
         message = update.get("message") or {}
@@ -1272,10 +1272,10 @@ class TelegramBotService:
                 action = "model"
             elif data.startswith("cmd:"):
                 action = data[4:]
-            logger.info("TG callback auth: user_id=%s action=%s", user_id, action)
+            logger.debug("TG callback auth: user_id=%s action=%s", user_id, action)
             allowed, ident = identity_manager.check_command_permission("telegram", user_id, action)
             if not allowed:
-                logger.warning("TG callback denied: user_id=%s identity=%s action=%s", user_id, ident, action)
+                logger.debug("TG callback denied: user_id=%s identity=%s action=%s", user_id, ident, action)
                 event_store.log("gateway.unauthorized", source="telegram", platform="telegram",
                                 chat_id=chat_id, payload={"callback_data": data, "user_id": user_id})
                 await self._send_message(chat_id, "⛔ Not authorized.")

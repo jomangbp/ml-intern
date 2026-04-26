@@ -119,19 +119,3 @@ async def list_crons():
     """List all cron tasks."""
     from prompt_cron import prompt_cron_manager
     return await prompt_cron_manager.list()
-
-
-@router.get("/debug/poll")
-async def debug_poll():
-    """Debug: check if telegram poll task is alive."""
-    from telegram_bot import telegram_bot_service
-    task = telegram_bot_service._task
-    return {
-        "bot_running": telegram_bot_service.running,
-        "task_exists": task is not None,
-        "task_done": task.done() if task else None,
-        "task_cancelled": task.cancelled() if task else None,
-        "offset": telegram_bot_service._offset,
-        "client_exists": telegram_bot_service._client is not None,
-        "active_sessions": len(telegram_bot_service._sessions),
-    }
