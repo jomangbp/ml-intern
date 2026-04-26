@@ -29,6 +29,7 @@ from session_manager import session_manager
 from gateway.identity import identity_manager
 from gateway.health import gateway_health, format_health_telegram
 from events.event_store import event_store
+from approvals.approval_store import approval_store
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +424,7 @@ class TelegramBotService:
                     {"command": "cancelcron", "description": "Cancel a cron"},
                     {"command": "sessions", "description": "Show sessions"},
                     {"command": "interrupt", "description": "Interrupt agent"},
+                    {"command": "approvals", "description": "List pending approvals"},
                     {"command": "cron", "description": "Create cron: /cron <min> <prompt>"},
                 ]
             })
@@ -434,6 +436,11 @@ class TelegramBotService:
         restored = await prompt_cron_manager.restore()
         if restored:
             logger.info("Restored %d Telegram crons", restored)
+
+        # Restore pending approvals
+        approval_restored = approval_store.restore()
+        if approval_restored:
+            logger.info("Restored %d pending approvals", approval_restored)
 
         event_store.log("gateway.started", source="gateway", payload={"adapters": ["telegram"]})
         logger.info("Telegram bot started")
@@ -713,6 +720,19 @@ class TelegramBotService:
             ok = await session_manager.interrupt(session_id)
             await self._send_message(chat_id, "🛑 Interrupted." if ok else "Nothing to interrupt.")
             return
+        if text == "/approvals":
+            pending = approval_store.list_pending(platform="telegram", chat_id=chat_id)
+            if not pending:
+                await self._send_message(chat_id, "🔐 No pending approvals.")
+            else:
+                lines = [f"🔐 *{len(pending)} Pending Approval(s):*\n"]
+                for p in pending[:5]:
+                    age = int(time.time() - p.created_at)
+                    lines.append(f"`{p.approval_id[:12]}` · {age}s ago")
+                    lines.append(p.summary)
+                    lines.append("")
+                await self._send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+            return
 
         cron_match = _CRON_RE.match(text)
         if cron_match:
@@ -741,6 +761,7 @@ class TelegramBotService:
             ],
             [
                 {"text": "🛑 Interrupt", "callback_data": "cmd:interrupt"},
+                {"text": "🔐 Approvals", "callback_data": "cmd:approvals"},
             ],
         ]
         help_text = (
@@ -1009,9 +1030,108 @@ class TelegramBotService:
                     await self._switch_model(chat_id, session_id, data[len("model:"):])
                 elif data.startswith("cmd:"):
                     await self._handle_menu_button(chat_id, data[4:])
+                elif data.startswith("approve:"):
+                    await self._handle_approve(chat_id, data[len("approve:"):])
+                elif data.startswith("reject:"):
+                    await self._handle_reject(chat_id, data[len("reject:"):])
+                elif data.startswith("details:"):
+                    await self._handle_approval_details(chat_id, data[len("details:"):])
             except Exception as e:
                 logger.exception("Callback failed")
                 await self._send_message(chat_id, f"❌ {e}")
+
+    # ── Approval Flow ──────────────────────────────────────────
+
+    async def _send_approval_request(self, chat_id: int, session_id: str, tools: list[dict]) -> None:
+        """Send an approval request with inline buttons to Telegram."""
+        record = approval_store.create(
+            session_id=session_id,
+            tools=tools,
+            platform="telegram",
+            chat_id=chat_id,
+            identity_id=getattr(self, '_current_identity', None) and self._current_identity.identity_id or "",
+            expiry_seconds=600,
+        )
+
+        # Build message
+        lines = ["⚠️ *Approval Required*\n"]
+        lines.append(f"Session: `{session_id[:8]}...`")
+        lines.append(f"Expires: 10 min\n")
+        for t in tools:
+            name = t.get("tool", "?")
+            args = t.get("arguments", {})
+            if name == "bash":
+                cmd = str(args.get("command", ""))[:100]
+                lines.append(f"💻 `{cmd}`")
+            elif name in ("write_file", "edit_file"):
+                path = str(args.get("path", ""))[:80]
+                lines.append(f"✏️ {name}: `{path}`")
+            elif name == "local_training":
+                script = str(args.get("script", ""))[:80]
+                lines.append(f"🏋️ train: `{script}`")
+            else:
+                preview = json.dumps(args, default=str)[:80]
+                lines.append(f"🔧 {name}: `{preview}`")
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": f"approve:{record.approval_id}"},
+                    {"text": "❌ Reject", "callback_data": f"reject:{record.approval_id}"},
+                ],
+                [
+                    {"text": "📋 Details", "callback_data": f"details:{record.approval_id}"},
+                ],
+            ],
+        }
+
+        msg_id = await self._send_message(
+            chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard,
+        )
+        if msg_id:
+            approval_store.set_message_id(record.approval_id, msg_id)
+
+    async def _handle_approve(self, chat_id: int, approval_id: str) -> None:
+        """Handle approve button press."""
+        record = await approval_store.approve(approval_id)
+        if not record:
+            await self._send_message(chat_id, "❌ Approval not found.")
+            return
+        if record.status == "expired":
+            await self._send_message(chat_id, "⏰ This approval has expired.")
+            return
+        if record.status == "approved":
+            # Update the approval message
+            if record.message_id:
+                await self._edit_message(chat_id, record.message_id, "✅ *Approved* (from Telegram)", parse_mode="Markdown")
+            else:
+                await self._send_message(chat_id, "✅ Approved.")
+        else:
+            await self._send_message(chat_id, f"❌ Approval failed: {record.status}")
+
+    async def _handle_reject(self, chat_id: int, approval_id: str) -> None:
+        """Handle reject button press."""
+        record = await approval_store.reject(approval_id)
+        if not record:
+            await self._send_message(chat_id, "❌ Approval not found.")
+            return
+        if record.status == "rejected":
+            if record.message_id:
+                await self._edit_message(chat_id, record.message_id, "❌ *Rejected* (from Telegram)", parse_mode="Markdown")
+            else:
+                await self._send_message(chat_id, "❌ Rejected.")
+        else:
+            await self._send_message(chat_id, f"⚠️ Unexpected status: {record.status}")
+
+    async def _handle_approval_details(self, chat_id: int, approval_id: str) -> None:
+        """Show full details of an approval request."""
+        record = approval_store.get(approval_id)
+        if not record:
+            await self._send_message(chat_id, "Approval not found.")
+            return
+        await self._send_message(chat_id, f"📋 *Approval Details*\n\n{record.details}")
+
+    # ── Menu Buttons ───────────────────────────────────────────
 
     async def _handle_menu_button(self, chat_id: int, action: str) -> None:
         """Handle inline keyboard menu button presses."""
@@ -1053,6 +1173,18 @@ class TelegramBotService:
             session_id = await self._ensure_session(chat_id)
             ok = await session_manager.interrupt(session_id)
             await self._send_message(chat_id, "🛑 Interrupted." if ok else "Nothing to interrupt.")
+        elif action == "approvals":
+            pending = approval_store.list_pending(platform="telegram", chat_id=chat_id)
+            if not pending:
+                await self._send_message(chat_id, "🔐 No pending approvals.")
+            else:
+                lines = [f"🔐 *{len(pending)} Pending Approval(s):*\n"]
+                for p in pending[:5]:
+                    age = int(time.time() - p.created_at)
+                    lines.append(f"`{p.approval_id[:12]}` · {age}s ago")
+                    lines.append(p.summary)
+                    lines.append("")
+                await self._send_message(chat_id, "\n".join(lines))
 
     # ── Gateway: Agent Turn ────────────────────────────────────────
 
@@ -1179,8 +1311,7 @@ class TelegramBotService:
                         await self._send_message(chat_id, f"❌ Error ({elapsed}):\n{err}")
                     elif et == "approval_required":
                         tools = data.get("tools", [])
-                        names = ", ".join(t.get("tool", "?") for t in tools)
-                        await self._send_message(chat_id, f"⚠️ Approval needed: {names}\nOpen Web UI to approve/reject.")
+                        await self._send_approval_request(chat_id, session_id, tools)
                     break
 
         finally:
