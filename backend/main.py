@@ -1,6 +1,7 @@
 """FastAPI application for HF Agent web interface."""
 
 import logging
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,12 +30,23 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     logger.info("Starting HF Agent backend...")
-    await telegram_bot_service.start()
+    # Schedule telegram bot start as a task so it doesn't block lifespan
+    asyncio.create_task(_start_telegram_safe())
     try:
         yield
     finally:
         await telegram_bot_service.stop()
         logger.info("Shutting down HF Agent backend...")
+
+
+async def _start_telegram_safe():
+    """Start telegram bot, catching any errors."""
+    try:
+        # Small delay to ensure event loop is fully running
+        await asyncio.sleep(0.5)
+        await telegram_bot_service.start()
+    except Exception as e:
+        logger.error("Telegram bot failed to start: %s", e)
 
 
 app = FastAPI(

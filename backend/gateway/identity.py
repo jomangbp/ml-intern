@@ -19,17 +19,17 @@ IDENTITY_STORE_PATH = Path(os.environ.get(
 # Default permissions by role
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "owner": {
-        "run_plan", "approve", "reject", "kill_job", "view_logs",
+        "run_plan", "approve", "reject", "kill_job", "view_logs", "view_status",
         "create_cron", "cancel_cron", "model_select", "session_new",
         "session_interrupt", "run_bash", "run_training", "gateway_admin",
     },
     "admin": {
-        "run_plan", "approve", "reject", "kill_job", "view_logs",
+        "run_plan", "approve", "reject", "kill_job", "view_logs", "view_status",
         "create_cron", "cancel_cron", "model_select", "session_new",
         "session_interrupt", "run_bash", "run_training",
     },
     "user": {
-        "run_plan", "view_logs", "create_cron", "cancel_cron",
+        "run_plan", "view_logs", "view_status", "create_cron", "cancel_cron",
         "model_select", "session_new", "session_interrupt",
     },
     "viewer": {
@@ -41,6 +41,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
 COMMAND_PERMISSIONS: dict[str, str] = {
     "new": "session_new",
     "model": "model_select",
+    "models": "model_select",
     "cron": "create_cron",
     "cancelcron": "cancel_cron",
     "interrupt": "session_interrupt",
@@ -50,14 +51,10 @@ COMMAND_PERMISSIONS: dict[str, str] = {
     "run": "run_bash",
     "jobs": "view_logs",
     "logs": "view_logs",
-    "jobs": "view_logs",
-    "logs": "view_logs",
-    "kill": "kill_job",
     "gateway": "view_status",
     "status": "view_status",
     "sessions": "view_status",
     "crons": "view_status",
-    "models": "view_status",
     "approvals": "view_status",
     "events": "gateway_admin",
 }

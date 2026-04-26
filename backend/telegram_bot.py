@@ -317,6 +317,7 @@ class TelegramBotService:
         self._running = False
         self._gateway_enabled: dict[int, bool] = {}  # legacy, kept for compat
         self._current_identity = None
+        self._poll_thread = None
 
     def _load_effective_config(self) -> dict[str, Any]:
         file_config = _read_config_file()
@@ -406,12 +407,33 @@ class TelegramBotService:
         if not self.enabled:
             logger.info("Telegram bot disabled")
             return
-        if self._task and not self._task.done():
+        if self._running and hasattr(self, '_poll_thread') and self._poll_thread and self._poll_thread.is_alive():
             return
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0))
         self._running = True
-        self._task = asyncio.create_task(self._poll_loop(), name="ml-intern-telegram-bot")
-        # Register bot commands so they appear as suggestions in the chat
+
+        # Ensure async client for API calls (setMyCommands, etc)
+        if not self._client or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0))
+
+        # Reset offset to latest to avoid re-processing old updates
+        try:
+            import requests as _req
+            r = _req.post(
+                f"{self.base_url}/getUpdates",
+                json={"offset": -1, "timeout": 0},
+                timeout=10,
+            )
+            results = r.json().get("result", [])
+            if results:
+                self._offset = max(int(u.get("update_id", 0)) for u in results) + 1
+                logger.info("TG offset reset to %d", self._offset)
+            else:
+                self._offset = 0  # start fresh, consume all pending
+        except Exception as e:
+            logger.warning("TG offset reset failed: %s", e)
+            self._offset = 0
+
+        # Register bot commands
         try:
             await self._api("setMyCommands", {
                 "commands": [
@@ -421,13 +443,10 @@ class TelegramBotService:
                     {"command": "status", "description": "Session status"},
                     {"command": "models", "description": "Choose model"},
                     {"command": "gateway", "description": "Gateway info"},
-                    {"command": "crons", "description": "List crons"},
-                    {"command": "cancelcron", "description": "Cancel a cron"},
-                    {"command": "sessions", "description": "Show sessions"},
-                    {"command": "interrupt", "description": "Interrupt agent"},
                     {"command": "jobs", "description": "List local jobs"},
                     {"command": "logs", "description": "View job logs: /logs <id>"},
                     {"command": "kill", "description": "Kill a job: /kill <id>"},
+                    {"command": "interrupt", "description": "Interrupt agent"},
                     {"command": "approvals", "description": "List pending approvals"},
                     {"command": "cron", "description": "Create cron: /cron <min> <prompt>"},
                 ]
@@ -435,24 +454,56 @@ class TelegramBotService:
         except Exception as e:
             logger.warning("Failed to register bot commands: %s", e)
 
-        # Register submit factory and restore persisted crons
+        # Restore state
         prompt_cron_manager.set_submit_factory(self._make_cron_submit_fn)
         restored = await prompt_cron_manager.restore()
         if restored:
             logger.info("Restored %d Telegram crons", restored)
-
-        # Restore pending approvals
         approval_restored = approval_store.restore()
         if approval_restored:
             logger.info("Restored %d pending approvals", approval_restored)
-
-        # Restore jobs
         jobs_restored = job_manager.restore()
         if jobs_restored:
             logger.info("Restored %d job records", jobs_restored)
 
         event_store.log("gateway.started", source="gateway", payload={"adapters": ["telegram"]})
-        logger.info("Telegram bot started")
+
+        # Start polling via subprocess to completely isolate from uvicorn
+        import subprocess
+        import sys
+        poll_script = (
+            "import json, urllib.request, sys, time\n"
+            "token = sys.argv[1]\n"
+            "offset = int(sys.argv[2])\n"
+            "base = f'https://api.telegram.org/bot{token}'\n"
+            "while True:\n"
+            "    try:\n"
+            "        payload = json.dumps({'offset': offset, 'timeout': 3, 'allowed_updates': ['message', 'callback_query']}).encode()\n"
+            "        req = urllib.request.Request(f'{base}/getUpdates', data=payload, headers={'Content-Type': 'application/json', 'Connection': 'close'}, method='POST')\n"
+            "        with urllib.request.urlopen(req, timeout=20) as resp:\n"
+            "            data = json.loads(resp.read().decode())\n"
+            "        results = data.get('result', [])\n"
+            "        for u in results:\n"
+            "            offset = max(offset, int(u.get('update_id', 0)) + 1)\n"
+            "            print(json.dumps(u), flush=True)\n"
+            "        if not results:\n"
+            "            print(json.dumps({'_ping': True}), flush=True)\n"
+            "    except Exception as e:\n"
+            "        print(json.dumps({'_error': str(e)}), flush=True)\n"
+            "        time.sleep(5)\n"
+        )
+        self._poll_process = subprocess.Popen(
+            [sys.executable, "-c", poll_script, self.token, str(self._offset)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        # Read updates from subprocess stdout in a thread
+        import threading
+        self._event_loop = asyncio.get_event_loop()
+        self._poll_reader = threading.Thread(target=self._read_poll_output, daemon=True, name="tg-poll-reader")
+        self._poll_reader.start()
+        logger.info("Telegram bot started (poll subprocess pid=%d)", self._poll_process.pid)
 
     async def stop(self) -> None:
         self._running = False
@@ -463,6 +514,12 @@ class TelegramBotService:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if hasattr(self, '_poll_process') and self._poll_process:
+            self._poll_process.terminate()
+            try:
+                self._poll_process.wait(timeout=5)
+            except Exception:
+                self._poll_process.kill()
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -550,24 +607,133 @@ class TelegramBotService:
     def _allowed(self, chat_id: int) -> bool:
         return not self.allowed_chat_ids or str(chat_id) in self.allowed_chat_ids
 
-    # ── Polling ───────────────────────────────────────────────────
+    # ── Polling (subprocess) ───────────────────────────────────────
 
-    async def _poll_loop(self) -> None:
-        while self._running:
+    def _read_poll_output(self) -> None:
+        """Read updates from poll subprocess stdout."""
+        import json as _json
+        logger.info("TG poll reader started")
+        while self._running and self._poll_process:
             try:
-                data = await self._api("getUpdates", {
-                    "offset": self._offset,
-                    "timeout": 30,
-                    "allowed_updates": ["message", "callback_query"],
-                })
-                for update in data.get("result", []):
-                    self._offset = max(self._offset, int(update.get("update_id", 0)) + 1)
-                    asyncio.create_task(self._handle_update(update))
-            except asyncio.CancelledError:
-                raise
+                line = self._poll_process.stdout.readline()
+                if not line:
+                    logger.warning("TG poll subprocess exited")
+                    break
+                line = line.decode().strip()
+                if not line:
+                    continue
+                if line and len(line) < 300:
+                    logger.debug("TG raw: %s", line[:200])
+                update = _json.loads(line)
+                if update.get("_ping"):
+                    self._ping_count = getattr(self, '_ping_count', 0) + 1
+                    if self._ping_count % 10 == 1:
+                        logger.info("TG poll alive (ping #%d)", self._ping_count)
+                    continue  # heartbeat
+                if update.get("_error"):
+                    logger.warning("TG poll subprocess error: %s", update["_error"])
+                    continue
+                # Real update
+                self._offset = max(self._offset, int(update.get("update_id", 0)) + 1)
+                logger.info("TG received update %d", update.get("update_id"))
+                try:
+                    self._event_loop.call_soon_threadsafe(
+                        lambda u=update: asyncio.ensure_future(self._handle_update(u), loop=self._event_loop)
+                    )
+                except RuntimeError:
+                    pass
             except Exception as e:
-                logger.warning("Telegram poll error: %s", e)
-                await asyncio.sleep(5)
+                logger.warning("TG poll reader error: %s", e)
+        logger.info("TG poll reader stopped")
+
+    def _sync_poll_loop(self) -> None:
+        """Synchronous polling loop in daemon thread.
+
+        Uses urllib (stdlib) to avoid requests/urllib3 issues in daemon threads.
+        """
+        import urllib.request
+        import urllib.error
+        import json as _json
+        import time
+        logger.info("TG sync poll thread started")
+        poll_count = 0
+        self._poll_count = 0
+        while self._running:
+            poll_count += 1
+            self._poll_count = poll_count
+            if poll_count <= 10 or poll_count % 60 == 0:
+                logger.info("TG poll #%d (offset=%d)", poll_count, self._offset)
+            try:
+                payload = _json.dumps({"offset": self._offset, "timeout": 3, "allowed_updates": ["message", "callback_query"]}).encode()
+                req = urllib.request.Request(
+                    f"{self.base_url}/getUpdates",
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Connection": "close"},
+                    method="POST",
+                )
+                # Force a hard socket timeout to prevent indefinite hangs
+                import socket
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(20)
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        data = _json.loads(resp.read().decode())
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+                if not data.get("ok"):
+                    time.sleep(5)
+                    continue
+                results = data.get("result", [])
+                if results:
+                    logger.info("TG poll: %d updates", len(results))
+                for update in results:
+                    self._offset = max(self._offset, int(update.get("update_id", 0)) + 1)
+                    try:
+                        self._event_loop.call_soon_threadsafe(
+                            lambda u=update: asyncio.ensure_future(self._handle_update(u), loop=self._event_loop)
+                        )
+                    except RuntimeError:
+                        pass
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    body = _json.loads(e.read().decode())
+                    wait = body.get("parameters", {}).get("retry_after", 5)
+                    logger.warning("TG poll 429, waiting %ds", wait)
+                    time.sleep(wait)
+                elif e.code == 409:
+                    logger.warning("TG poll 409, waiting 10s")
+                    time.sleep(10)
+                else:
+                    logger.warning("TG poll HTTP %d", e.code)
+                    time.sleep(5)
+            except Exception as e:
+                logger.warning("TG sync poll error: %s", e)
+                time.sleep(5)
+        logger.info("TG sync poll thread stopped")
+
+    async def _poll_watchdog(self) -> None:
+        """Restart the poll thread if it stops responding."""
+        import asyncio as _asyncio
+        last_count = 0
+        while self._running:
+            await _asyncio.sleep(30)
+            if not self._running:
+                break
+            current_count = 0
+            # Count polls by reading the instance variable
+            current_count = getattr(self, '_poll_count', 0)
+            if current_count == last_count and self._running:
+                # Thread might be stuck, check if alive
+                if self._poll_thread and not self._poll_thread.is_alive():
+                    logger.warning("TG poll thread died, restarting")
+                    import threading
+                    self._poll_thread = threading.Thread(target=self._sync_poll_loop, daemon=False, name="tg-poll")
+                    self._poll_thread.start()
+                else:
+                    logger.warning("TG poll thread stuck (count=%d), sending interrupt", current_count)
+                    # Thread is alive but stuck - can't really interrupt it
+                    # Just log and wait
+            last_count = current_count
 
     # ── Session management ────────────────────────────────────────
 
@@ -595,6 +761,7 @@ class TelegramBotService:
     # ── Message routing ───────────────────────────────────────────
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
+        logger.info("TG update received: %s", list(update.keys()))
         # Extract user info from either message or callback_query
         user_id = None
         message = update.get("message") or {}
@@ -1105,8 +1272,10 @@ class TelegramBotService:
                 action = "model"
             elif data.startswith("cmd:"):
                 action = data[4:]
-            allowed, _ = identity_manager.check_command_permission("telegram", user_id, action)
+            logger.info("TG callback auth: user_id=%s action=%s", user_id, action)
+            allowed, ident = identity_manager.check_command_permission("telegram", user_id, action)
             if not allowed:
+                logger.warning("TG callback denied: user_id=%s identity=%s action=%s", user_id, ident, action)
                 event_store.log("gateway.unauthorized", source="telegram", platform="telegram",
                                 chat_id=chat_id, payload={"callback_data": data, "user_id": user_id})
                 await self._send_message(chat_id, "⛔ Not authorized.")
