@@ -24,8 +24,13 @@ class Config(BaseModel):
     model_name: str
     mcpServers: dict[str, MCPServerConfig] = {}
     save_sessions: bool = True
-    session_dataset_repo: str = "akseljoonas/hf-agent-sessions"
-    auto_save_interval: int = 3  # Save every N user turns (0 = disabled)
+    session_dataset_repo: str = "smolagents/ml-intern-sessions"
+    auto_save_interval: int = 1  # Save every N user turns (0 = disabled)
+    # Mid-turn heartbeat: save + upload every N seconds while events are being
+    # emitted. Guards against losing trace data on long-running turns that
+    # crash before turn_complete (e.g. a multi-hour hf_jobs wait that OOMs).
+    # 0 = disabled. Consumed by agent.core.telemetry.HeartbeatSaver.
+    heartbeat_interval_s: int = 60
     yolo_mode: bool = False  # Auto-approve all tool calls without confirmation
     max_iterations: int = 300  # Max LLM calls per agent turn (-1 = unlimited)
 
@@ -33,14 +38,15 @@ class Config(BaseModel):
     confirm_cpu_jobs: bool = True
     auto_file_upload: bool = False
 
-    # Reasoning effort for models that support it (GPT-5 / o-series, Claude
-    # extended thinking, HF reasoning models like MiniMax M2 / Kimi K2).
-    # Defaults to "high" — we'd rather spend tokens thinking than ship a
-    # wrong ML recipe. Users can dial down with `/effort low|medium|off`.
-    # "minimal" is an OpenAI-only level and is normalized to "low" for HF
-    # router models (MiniMax requires ≥low). Ignored for non-reasoning models.
-    # Valid values: None | "minimal" | "low" | "medium" | "high"
-    reasoning_effort: str | None = "high"
+    # Reasoning effort *preference* — the ceiling the user wants. The probe
+    # on `/model` walks a cascade down from here (``max`` → ``xhigh`` → ``high``
+    # → …) and caches per-model what the provider actually accepted in
+    # ``Session.model_effective_effort``. Default ``max`` because we'd rather
+    # burn tokens thinking than ship a wrong ML recipe; the cascade lands on
+    # whichever level the model supports (``high`` for GPT-5 / HF router,
+    # ``xhigh`` or ``max`` for Anthropic 4.6 / 4.7). ``None`` = thinking off.
+    # Valid values: None | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    reasoning_effort: str | None = "max"
 
 
 def substitute_env_vars(obj: Any) -> Any:

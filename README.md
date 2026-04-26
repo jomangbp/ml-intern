@@ -406,6 +406,10 @@ AVAILABLE_MODELS.append({
 
 Edit `agent/core/tools.py` — add a `ToolSpec` with name, description, JSON schema, and async handler.
 
+Model defaults live in:
+- `configs/cli_agent_config.json` (CLI)
+- `configs/frontend_agent_config.json` (web sessions)
+
 ---
 
 ## Troubleshooting

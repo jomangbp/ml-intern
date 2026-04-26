@@ -30,13 +30,49 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     logger.info("Starting HF Agent backend...")
-    # Schedule telegram bot start as a task so it doesn't block lifespan
+
+    # Schedule telegram bot start as a task so it doesn't block lifespan.
     asyncio.create_task(_start_telegram_safe())
+
+    # Start in-process hourly KPI rollup.
+    try:
+        import kpis_scheduler
+        kpis_scheduler.start()
+    except Exception as e:
+        logger.warning("KPI scheduler failed to start: %s", e)
+
     try:
         yield
     finally:
-        await telegram_bot_service.stop()
         logger.info("Shutting down HF Agent backend...")
+
+        # Stop KPI scheduler
+        try:
+            import kpis_scheduler
+            await kpis_scheduler.shutdown()
+        except Exception as e:
+            logger.warning("KPI scheduler shutdown failed: %s", e)
+
+        # Final-flush: save every still-active session so we don't lose traces
+        # on server restart. Uploads are detached subprocesses — this is fast.
+        try:
+            from session_manager import session_manager
+            for sid, agent_session in list(session_manager.sessions.items()):
+                sess = agent_session.session
+                if sess.config.save_sessions:
+                    try:
+                        sess.save_and_upload_detached(sess.config.session_dataset_repo)
+                        logger.info("Flushed session %s on shutdown", sid)
+                    except Exception as e:
+                        logger.warning("Failed to flush session %s: %s", sid, e)
+        except Exception as e:
+            logger.warning("Lifespan final-flush skipped: %s", e)
+
+        # Stop telegram bot
+        try:
+            await telegram_bot_service.stop()
+        except Exception as e:
+            logger.warning("Telegram bot stop failed: %s", e)
 
 
 async def _start_telegram_safe():

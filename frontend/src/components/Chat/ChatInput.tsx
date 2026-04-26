@@ -4,6 +4,11 @@ import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import StopIcon from '@mui/icons-material/Stop';
 import { apiFetch } from '@/utils/api';
+import { useUserQuota } from '@/hooks/useUserQuota';
+import ClaudeCapDialog from '@/components/ClaudeCapDialog';
+import JobsUpgradeDialog from '@/components/JobsUpgradeDialog';
+import { useAgentStore } from '@/store/agentStore';
+import { FIRST_FREE_MODEL_PATH } from '@/utils/model';
 
 // Model configuration
 interface ApiModelOption {
@@ -82,17 +87,33 @@ interface ChatInputProps {
   sessionId?: string;
   onSend: (text: string) => void;
   onStop?: () => void;
+  onDeclineBlockedJobs?: () => Promise<boolean>;
+  onContinueBlockedJobsWithNamespace?: (namespace: string) => Promise<boolean>;
   isProcessing?: boolean;
   disabled?: boolean;
   placeholder?: string;
 }
 
-export default function ChatInput({ sessionId, onSend, onStop, isProcessing = false, disabled = false, placeholder = 'Ask anything...' }: ChatInputProps) {
+const isClaudeModel = (m: ModelOption) => m.modelPath.startsWith('anthropic/');
+const firstFreeModel = (options: ModelOption[]) => options.find(m => !isClaudeModel(m)) ?? options[0];
+
+export default function ChatInput({ sessionId, onSend, onStop, onDeclineBlockedJobs, onContinueBlockedJobsWithNamespace, isProcessing = false, disabled = false, placeholder = 'Ask anything...' }: ChatInputProps) {
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>(() => FALLBACK_API_MODELS.map(apiModelToOption));
   const [selectedModelPath, setSelectedModelPath] = useState<string>(FALLBACK_API_MODELS[0].id);
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
+  const { quota, refresh: refreshQuota } = useUserQuota();
+  // The daily-cap dialog is triggered from two places: (a) a 429 returned
+  // from the chat transport when the user tries to send on Opus over cap —
+  // surfaced via the agent-store flag — and (b) nothing else right now
+  // (switching models is free). Keeping the open state in the store means
+  // the hook layer can flip it without threading props through.
+  const claudeQuotaExhausted = useAgentStore((s) => s.claudeQuotaExhausted);
+  const setClaudeQuotaExhausted = useAgentStore((s) => s.setClaudeQuotaExhausted);
+  const jobsUpgradeRequired = useAgentStore((s) => s.jobsUpgradeRequired);
+  const setJobsUpgradeRequired = useAgentStore((s) => s.setJobsUpgradeRequired);
+  const lastSentRef = useRef<string>('');
 
   // Load server-provided model list so UI stays in sync with backend config.
   useEffect(() => {
@@ -148,10 +169,26 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
 
   const handleSend = useCallback(() => {
     if (input.trim() && !disabled) {
+      lastSentRef.current = input;
       onSend(input);
       setInput('');
     }
   }, [input, disabled, onSend]);
+
+  // When the chat transport reports a Claude-quota 429, restore the typed
+  // text so the user doesn't lose their message.
+  useEffect(() => {
+    if (claudeQuotaExhausted && lastSentRef.current) {
+      setInput(lastSentRef.current);
+    }
+  }, [claudeQuotaExhausted]);
+
+  // Refresh the quota display whenever the session changes (user might
+  // have started another tab that spent quota).
+  useEffect(() => {
+    if (sessionId) refreshQuota();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLDivElement>) => {
@@ -182,6 +219,83 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
       if (res.ok) setSelectedModelPath(model.modelPath);
     } catch { /* ignore */ }
   };
+
+  // Dialog close: just clear the flag. The typed text is already restored.
+  const handleCapDialogClose = useCallback(() => {
+    setClaudeQuotaExhausted(false);
+  }, [setClaudeQuotaExhausted]);
+
+  // "Use a free model" — switch the current session to Kimi (or the first
+  // non-Anthropic option) and auto-retry the send that tripped the cap.
+  const handleUseFreeModel = useCallback(async () => {
+    setClaudeQuotaExhausted(false);
+    if (!sessionId) return;
+    const free = modelOptions.find(m => m.modelPath === FIRST_FREE_MODEL_PATH)
+      ?? firstFreeModel(modelOptions);
+    try {
+      const res = await apiFetch(`/api/session/${sessionId}/model`, {
+        method: 'POST',
+        body: JSON.stringify({ model: free.modelPath }),
+      });
+      if (res.ok) {
+        setSelectedModelPath(free.modelPath);
+        const retryText = lastSentRef.current;
+        if (retryText) {
+          onSend(retryText);
+          setInput('');
+          lastSentRef.current = '';
+        }
+      }
+    } catch { /* ignore */ }
+  }, [sessionId, onSend, setClaudeQuotaExhausted]);
+
+  const handleClaudeUpgradeClick = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      await apiFetch(`/api/pro-click/${sessionId}`, {
+        method: 'POST',
+        body: JSON.stringify({ source: 'claude_cap_dialog', target: 'pro_pricing' }),
+      });
+    } catch {
+      /* tracking is best-effort */
+    }
+  }, [sessionId]);
+
+  const handleJobsUpgradeClose = useCallback(() => {
+    setJobsUpgradeRequired(null);
+  }, [setJobsUpgradeRequired]);
+
+  const handleJobsUpgradeClick = useCallback(async () => {
+    if (!sessionId || !jobsUpgradeRequired) return;
+    try {
+      await apiFetch(`/api/pro-click/${sessionId}`, {
+        method: 'POST',
+        body: JSON.stringify({ source: 'hf_jobs_upgrade_dialog', target: 'pro_pricing' }),
+      });
+    } catch {
+      /* tracking is best-effort */
+    }
+  }, [sessionId, jobsUpgradeRequired]);
+
+  const handleDeclineBlockedJobs = useCallback(async () => {
+    if (!onDeclineBlockedJobs) return;
+    await onDeclineBlockedJobs();
+  }, [onDeclineBlockedJobs]);
+
+  const handleContinueBlockedJobsWithNamespace = useCallback(async (namespace: string) => {
+    if (!onContinueBlockedJobsWithNamespace) return;
+    await onContinueBlockedJobsWithNamespace(namespace);
+  }, [onContinueBlockedJobsWithNamespace]);
+
+  // Hide the chip until the user has actually burned quota — an unused
+  // Opus session shouldn't populate a counter.
+  const claudeChip = (() => {
+    if (!quota || quota.claudeUsedToday === 0) return null;
+    if (quota.plan === 'free') {
+      return quota.claudeRemaining > 0 ? 'Free today' : 'Pro only';
+    }
+    return `${quota.claudeUsedToday}/${quota.claudeDailyCap} today`;
+  })();
 
   return (
     <Box
@@ -381,6 +495,19 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
                         }}
                       />
                     )}
+                    {isClaudeModel(model) && claudeChip && (
+                      <Chip
+                        label={claudeChip}
+                        size="small"
+                        sx={{
+                          height: '18px',
+                          fontSize: '10px',
+                          bgcolor: 'rgba(255,255,255,0.08)',
+                          color: 'var(--muted-text)',
+                          fontWeight: 600,
+                        }}
+                      />
+                    )}
                   </Box>
                 }
                 secondary={model.description}
@@ -391,6 +518,25 @@ export default function ChatInput({ sessionId, onSend, onStop, isProcessing = fa
             </MenuItem>
           ))}
         </Menu>
+
+        <ClaudeCapDialog
+          open={claudeQuotaExhausted}
+          plan={quota?.plan ?? 'free'}
+          cap={quota?.claudeDailyCap ?? 1}
+          onClose={handleCapDialogClose}
+          onUseFreeModel={handleUseFreeModel}
+          onUpgrade={handleClaudeUpgradeClick}
+        />
+        <JobsUpgradeDialog
+          open={!!jobsUpgradeRequired}
+          mode={jobsUpgradeRequired?.mode || 'upgrade'}
+          message={jobsUpgradeRequired?.message || ''}
+          eligibleNamespaces={jobsUpgradeRequired?.eligibleNamespaces || []}
+          onClose={handleJobsUpgradeClose}
+          onUpgrade={handleJobsUpgradeClick}
+          onDecline={handleDeclineBlockedJobs}
+          onContinueWithNamespace={handleContinueBlockedJobsWithNamespace}
+        />
       </Box>
     </Box>
   );
