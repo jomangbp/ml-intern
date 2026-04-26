@@ -26,6 +26,9 @@ import httpx
 from model_catalog import AVAILABLE_MODELS, format_models_for_text, resolve_model_choice
 from prompt_cron import prompt_cron_manager
 from session_manager import session_manager
+from gateway.identity import identity_manager
+from gateway.health import gateway_health, format_health_telegram
+from events.event_store import event_store
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +314,7 @@ class TelegramBotService:
         self._locks: dict[int, asyncio.Lock] = {}
         self._running = False
         self._gateway_enabled: dict[int, bool] = {}  # legacy, kept for compat
+        self._current_identity = None
 
     def _load_effective_config(self) -> dict[str, Any]:
         file_config = _read_config_file()
@@ -431,10 +435,12 @@ class TelegramBotService:
         if restored:
             logger.info("Restored %d Telegram crons", restored)
 
+        event_store.log("gateway.started", source="gateway", payload={"adapters": ["telegram"]})
         logger.info("Telegram bot started")
 
     async def stop(self) -> None:
         self._running = False
+        event_store.log("gateway.stopped", source="gateway")
         if self._task:
             self._task.cancel()
             try:
@@ -573,19 +579,56 @@ class TelegramBotService:
     # ── Message routing ───────────────────────────────────────────
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
-        if "callback_query" in update:
-            await self._handle_callback_query(update["callback_query"])
+        # Extract user info from either message or callback_query
+        user_id = None
+        message = update.get("message") or {}
+        callback_query = update.get("callback_query") or {}
+
+        if callback_query:
+            from_user = callback_query.get("from") or {}
+            user_id = from_user.get("id")
+        elif message:
+            from_user = message.get("from") or {}
+            user_id = from_user.get("id")
+
+        # Resolve identity
+        if user_id:
+            display_name = (from_user.get("first_name", "") + " " + from_user.get("last_name", "")).strip()
+            self._current_identity = identity_manager.resolve_or_create(
+                platform="telegram",
+                platform_user_id=user_id,
+                display_name=display_name,
+            )
+        else:
+            self._current_identity = None
+
+        if callback_query:
+            await self._handle_callback_query(callback_query)
             return
 
-        message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         text = (message.get("text") or "").strip()
         if not isinstance(chat_id, int) or not text:
             return
+
+        # Chat-level allowlist (routing filter)
         if not self._allowed(chat_id):
+            event_store.log("telegram.unauthorized", source="telegram", platform="telegram",
+                            chat_id=chat_id, payload={"user_id": user_id, "text": text[:50]})
             await self._send_message(chat_id, "This chat is not allowed.")
             return
+
+        # User-level authorization for commands
+        if text.startswith("/") and self._current_identity:
+            cmd_name = text.split()[0].lstrip("/").split("@")[0]  # handle /command@botname
+            allowed, _ = identity_manager.check_command_permission("telegram", user_id, cmd_name)
+            if not allowed:
+                event_store.log("gateway.unauthorized", source="telegram", platform="telegram",
+                                identity_id=self._current_identity.identity_id, chat_id=chat_id,
+                                payload={"command": cmd_name, "user_id": user_id})
+                await self._send_message(chat_id, "⛔ You don't have permission for this command.")
+                return
 
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
@@ -619,15 +662,19 @@ class TelegramBotService:
             )
             return
 
-        # ── Gateway commands ──
         if text == "/gateway" or text == "/gateway status":
-            agent_session = session_manager.sessions.get(session_id)
-            model = agent_session.session.config.model_name if agent_session else "?"
-            await self._send_message(
-                chat_id,
-                f"🔌 *Gateway Active*\nModel: `{model}`\nMode: `{self.execution_mode}`\n\nLive tool feed is always on.",
-                parse_mode="Markdown",
+            active_sessions = sum(1 for s in session_manager.sessions.values() if s.is_active)
+            crons = await prompt_cron_manager.list()
+            active_crons = sum(1 for c in crons if c.get("status") in ("scheduled", "running"))
+            health = gateway_health(
+                telegram_running=True,
+                telegram_enabled=True,
+                active_sessions=active_sessions,
+                active_crons=active_crons,
+                running_jobs=0,
+                event_stats=event_store.stats(),
             )
+            await self._send_message(chat_id, format_health_telegram(health), parse_mode="Markdown")
             return
 
         if text == "/sessions":
@@ -928,6 +975,9 @@ class TelegramBotService:
         chat = (callback_query.get("message") or {}).get("chat") or {}
         chat_id = chat.get("id")
         data = callback_query.get("data", "")
+        from_user = callback_query.get("from") or {}
+        user_id = from_user.get("id")
+
         try:
             await self._api("answerCallbackQuery", {"callback_query_id": query_id})
         except Exception:
@@ -936,6 +986,21 @@ class TelegramBotService:
             return
         if not self._allowed(chat_id):
             return
+
+        # User-level authorization for callback buttons
+        if user_id:
+            action = data.split(":")[-1] if ":" in data else data
+            if data.startswith("model:"):
+                action = "model"
+            elif data.startswith("cmd:"):
+                action = data[4:]
+            allowed, _ = identity_manager.check_command_permission("telegram", user_id, action)
+            if not allowed:
+                event_store.log("gateway.unauthorized", source="telegram", platform="telegram",
+                                chat_id=chat_id, payload={"callback_data": data, "user_id": user_id})
+                await self._send_message(chat_id, "⛔ Not authorized.")
+                return
+
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
             try:

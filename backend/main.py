@@ -61,14 +61,6 @@ app.add_middleware(
 app.include_router(agent_router)
 app.include_router(auth_router)
 
-# Serve static files (frontend build) in production
-static_path = Path(__file__).parent.parent / "static"
-if static_path.exists():
-    app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
-    logger.info(f"Serving static files from {static_path}")
-else:
-    logger.info("No static directory found, running in API-only mode")
-
 
 @app.get("/api")
 async def api_root():
@@ -78,6 +70,40 @@ async def api_root():
         "version": "1.0.0",
         "docs": "/docs",
     }
+
+
+@app.get("/api/gateway/health")
+async def gateway_health_endpoint():
+    """Gateway health endpoint — works with or without Telegram."""
+    from gateway.health import gateway_health
+    from gateway.identity import identity_manager
+    from events.event_store import event_store
+    from prompt_cron import prompt_cron_manager
+    from telegram_bot import telegram_bot_service
+    from session_manager import session_manager
+
+    active_sessions = sum(1 for s in session_manager.sessions.values() if s.is_active)
+    crons = await prompt_cron_manager.list()
+    active_crons = sum(1 for c in crons if c.get("status") in ("scheduled", "running"))
+
+    return gateway_health(
+        telegram_running=telegram_bot_service.running,
+        telegram_enabled=telegram_bot_service.enabled,
+        active_sessions=active_sessions,
+        active_crons=active_crons,
+        running_jobs=0,
+        event_stats=event_store.stats(),
+    )
+
+
+# Serve static files (frontend build) in production
+# MUST be after all API routes — mount("/") catches everything
+static_path = Path(__file__).parent.parent / "static"
+if static_path.exists():
+    app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
+    logger.info(f"Serving static files from {static_path}")
+else:
+    logger.info("No static directory found, running in API-only mode")
 
 
 if __name__ == "__main__":
