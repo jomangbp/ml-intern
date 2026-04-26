@@ -81,6 +81,7 @@ async def gateway_health_endpoint():
     from prompt_cron import prompt_cron_manager
     from telegram_bot import telegram_bot_service
     from session_manager import session_manager
+    from jobs.local_job_manager import job_manager
 
     active_sessions = sum(1 for s in session_manager.sessions.values() if s.is_active)
     crons = await prompt_cron_manager.list()
@@ -91,7 +92,7 @@ async def gateway_health_endpoint():
         telegram_enabled=telegram_bot_service.enabled,
         active_sessions=active_sessions,
         active_crons=active_crons,
-        running_jobs=0,
+        running_jobs=job_manager.running_count(),
         event_stats=event_store.stats(),
     )
 

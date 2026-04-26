@@ -30,6 +30,7 @@ from gateway.identity import identity_manager
 from gateway.health import gateway_health, format_health_telegram
 from events.event_store import event_store
 from approvals.approval_store import approval_store
+from jobs.local_job_manager import job_manager
 
 logger = logging.getLogger(__name__)
 
@@ -424,6 +425,9 @@ class TelegramBotService:
                     {"command": "cancelcron", "description": "Cancel a cron"},
                     {"command": "sessions", "description": "Show sessions"},
                     {"command": "interrupt", "description": "Interrupt agent"},
+                    {"command": "jobs", "description": "List local jobs"},
+                    {"command": "logs", "description": "View job logs: /logs <id>"},
+                    {"command": "kill", "description": "Kill a job: /kill <id>"},
                     {"command": "approvals", "description": "List pending approvals"},
                     {"command": "cron", "description": "Create cron: /cron <min> <prompt>"},
                 ]
@@ -441,6 +445,11 @@ class TelegramBotService:
         approval_restored = approval_store.restore()
         if approval_restored:
             logger.info("Restored %d pending approvals", approval_restored)
+
+        # Restore jobs
+        jobs_restored = job_manager.restore()
+        if jobs_restored:
+            logger.info("Restored %d job records", jobs_restored)
 
         event_store.log("gateway.started", source="gateway", payload={"adapters": ["telegram"]})
         logger.info("Telegram bot started")
@@ -678,7 +687,7 @@ class TelegramBotService:
                 telegram_enabled=True,
                 active_sessions=active_sessions,
                 active_crons=active_crons,
-                running_jobs=0,
+                running_jobs=job_manager.running_count(),
                 event_stats=event_store.stats(),
             )
             await self._send_message(chat_id, format_health_telegram(health), parse_mode="Markdown")
@@ -719,6 +728,23 @@ class TelegramBotService:
         if text == "/interrupt":
             ok = await session_manager.interrupt(session_id)
             await self._send_message(chat_id, "🛑 Interrupted." if ok else "Nothing to interrupt.")
+            return
+        if text == "/jobs":
+            await self._cmd_jobs(chat_id)
+            return
+        if text.startswith("/logs"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                await self._send_message(chat_id, "Usage: /logs <job_id>")
+            else:
+                await self._cmd_logs(chat_id, parts[1].strip())
+            return
+        if text.startswith("/kill"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                await self._send_message(chat_id, "Usage: /kill <job_id>")
+            else:
+                await self._cmd_kill(chat_id, parts[1].strip())
             return
         if text == "/approvals":
             pending = approval_store.list_pending(platform="telegram", chat_id=chat_id)
@@ -761,6 +787,9 @@ class TelegramBotService:
             ],
             [
                 {"text": "🛑 Interrupt", "callback_data": "cmd:interrupt"},
+                {"text": "🔧 Jobs", "callback_data": "cmd:jobs"},
+            ],
+            [
                 {"text": "🔐 Approvals", "callback_data": "cmd:approvals"},
             ],
         ]
@@ -780,6 +809,67 @@ class TelegramBotService:
             "disable_web_page_preview": True,
             "reply_markup": {"inline_keyboard": keyboard},
         })
+
+    # ── Job Commands ─────────────────────────────────────────────
+
+    async def _cmd_jobs(self, chat_id: int) -> None:
+        """List local jobs."""
+        running = job_manager.list_jobs(status="running")
+        recent = job_manager.list_jobs(limit=10)
+
+        if not recent:
+            await self._send_message(chat_id, "No jobs found.")
+            return
+
+        lines = [f"🔧 *Jobs* ({len(running)} running)\n"]
+        for j in recent[:10]:
+            icon = {"running": "🟢", "completed": "✅", "failed": "❌", "cancelled": "⚪", "killed": "💀"}.get(j.status, "❓")
+            cmd_preview = j.command[:50]
+            elapsed = j.elapsed if j.status == "running" else ""
+            lines.append(f"{icon} `{j.job_id[:12]}` · {j.kind} · {j.status} {elapsed}")
+            lines.append(f"   `{cmd_preview}`")
+
+        await self._send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+
+    async def _cmd_logs(self, chat_id: int, job_id: str) -> None:
+        """Show last lines of a job log."""
+        # Support partial match
+        record = job_manager.get_job(job_id)
+        if not record:
+            for j in job_manager.list_jobs():
+                if j.job_id.startswith(job_id):
+                    record = j
+                    break
+        if not record:
+            await self._send_message(chat_id, f"Job `{job_id}` not found.")
+            return
+
+        logs = job_manager.tail_logs(record.job_id, lines=50)
+        header = f"📋 Logs for `{record.job_id[:12]}`:\n"
+        await self._send_message(chat_id, header + "```\n" + logs[:3500] + "\n```")
+
+    async def _cmd_kill(self, chat_id: int, job_id: str) -> None:
+        """Kill a running job."""
+        record = job_manager.get_job(job_id)
+        if not record:
+            for j in job_manager.list_jobs():
+                if j.job_id.startswith(job_id):
+                    record = j
+                    break
+        if not record:
+            await self._send_message(chat_id, f"Job `{job_id}` not found.")
+            return
+        if record.status != "running":
+            await self._send_message(chat_id, f"Job `{record.job_id[:12]}` is not running (status: {record.status}).")
+            return
+
+        result = await job_manager.kill_job(record.job_id)
+        if result:
+            await self._send_message(chat_id, f"💀 Killed job `{record.job_id[:12]}` (pid {record.pid})")
+        else:
+            await self._send_message(chat_id, f"❌ Failed to kill job.")
+
+    # ── Cron Factory ──────────────────────────────────────────────
 
     def _make_cron_submit_fn(self, chat_id_str: str, session_id: str, config: dict) -> SubmitPrompt:
         """Create a submit function for a cron job. Used by prompt_cron_manager.restore()."""
@@ -1173,6 +1263,8 @@ class TelegramBotService:
             session_id = await self._ensure_session(chat_id)
             ok = await session_manager.interrupt(session_id)
             await self._send_message(chat_id, "🛑 Interrupted." if ok else "Nothing to interrupt.")
+        elif action == "jobs":
+            await self._cmd_jobs(chat_id)
         elif action == "approvals":
             pending = approval_store.list_pending(platform="telegram", chat_id=chat_id)
             if not pending:
