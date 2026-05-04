@@ -904,6 +904,11 @@ async def _call_llm_ollama_direct(session: Session, messages, tools, llm_params)
     t_start = time.monotonic()
     llm_attempt = 0
     while True:
+        full_content = ""
+        tool_calls_acc: dict[int, dict] = {}
+        token_count = 0
+        finish_reason: str | None = None
+        final_usage_chunk = None
         try:
             stream = ollama_chat_streaming(
                 model=llm_params["model"],
@@ -912,7 +917,62 @@ async def _call_llm_ollama_direct(session: Session, messages, tools, llm_params)
                 llm_params=llm_params,
                 timeout=600,
             )
-            break
+            async for chunk in stream:
+                if session.is_cancelled:
+                    return await _make_cancelled_result(session)
+
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    if chunk.usage:
+                        token_count = chunk.usage.total_tokens
+                        final_usage_chunk = chunk
+                    continue
+
+                delta = choice.delta
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                if delta.content:
+                    full_content += delta.content
+                    await session.send_event(
+                        Event(event_type="assistant_chunk", data={"content": delta.content})
+                    )
+
+                # Forward thinking/reasoning content so the UI shows progress
+                # during the model's "thinking" phase (deepseek-v4, qwen3, etc).
+                # Without this, the UI shows nothing for 15-30s while the model
+                # thinks, leading users to believe it's not answering.
+                if delta.reasoning_content:
+                    await session.send_event(
+                        Event(event_type="assistant_chunk", data={"content": delta.reasoning_content, "reasoning": True})
+                    )
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": "", "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        if tc_delta.id:
+                            tool_calls_acc[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_acc[idx]["function"]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_acc[idx]["function"]["arguments"] = tc_delta.function.arguments
+
+                if chunk.usage:
+                    token_count = chunk.usage.total_tokens
+                    final_usage_chunk = chunk
+
+            # ── Empty response detection ─────────────────────────────────
+            if not full_content and not tool_calls_acc:
+                raise RuntimeError("Model returned empty response with no tool calls")
+
+            break  # ── Success: we got a valid response ──
+
         except ContextWindowExceededError:
             raise
         except asyncio.CancelledError:
@@ -939,72 +999,6 @@ async def _call_llm_ollama_direct(session: Session, messages, tools, llm_params)
             llm_attempt += 1
             await asyncio.sleep(delay)
             continue
-
-    full_content = ""
-    tool_calls_acc: dict[int, dict] = {}
-    token_count = 0
-    finish_reason: str | None = None
-    final_usage_chunk = None
-
-    try:
-        async for chunk in stream:
-            if session.is_cancelled:
-                return await _make_cancelled_result(session)
-
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                if chunk.usage:
-                    token_count = chunk.usage.total_tokens
-                    final_usage_chunk = chunk
-                continue
-
-            delta = choice.delta
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
-
-            if delta.content:
-                full_content += delta.content
-                await session.send_event(
-                    Event(event_type="assistant_chunk", data={"content": delta.content})
-                )
-
-            # Forward thinking/reasoning content so the UI shows progress
-            # during the model's "thinking" phase (deepseek-v4, qwen3, etc).
-            # Without this, the UI shows nothing for 15-30s while the model
-            # thinks, leading users to believe it's not answering.
-            if delta.reasoning_content:
-                await session.send_event(
-                    Event(event_type="assistant_chunk", data={"content": delta.reasoning_content, "reasoning": True})
-                )
-
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": "", "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        }
-                    if tc_delta.id:
-                        tool_calls_acc[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls_acc[idx]["function"]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls_acc[idx]["function"]["arguments"] = tc_delta.function.arguments
-
-            if chunk.usage:
-                token_count = chunk.usage.total_tokens
-                final_usage_chunk = chunk
-
-        # ── Empty response detection ─────────────────────────────────
-        if not full_content and not tool_calls_acc:
-            raise RuntimeError("Model returned empty response with no tool calls")
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        # Make sure the underlying stream is closed on any error
-        raise
 
     usage = await telemetry.record_llm_call(
         session,
