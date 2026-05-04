@@ -938,15 +938,6 @@ async def _call_llm_ollama_direct(session: Session, messages, tools, llm_params)
                         Event(event_type="assistant_chunk", data={"content": delta.content})
                     )
 
-                # Forward thinking/reasoning content so the UI shows progress
-                # during the model's "thinking" phase (deepseek-v4, qwen3, etc).
-                # Without this, the UI shows nothing for 15-30s while the model
-                # thinks, leading users to believe it's not answering.
-                if delta.reasoning_content:
-                    await session.send_event(
-                        Event(event_type="assistant_chunk", data={"content": delta.reasoning_content, "reasoning": True})
-                    )
-
                 if delta.tool_calls:
                     for tc_delta in delta.tool_calls:
                         idx = tc_delta.index
