@@ -117,6 +117,19 @@ async def summarize_messages(
     """
     from agent.core.llm_params import _resolve_llm_params
 
+    # ── Ollama direct path — never touch litellm ─────────────────────
+    if model_name.startswith(("ollama/", "ollama_chat/")):
+        from agent.core.ollama_client import _messages_to_dict_compact, ollama_chat_compact
+        msg_dicts = _messages_to_dict_compact(messages)
+        msg_dicts.append({"role": "user", "content": prompt})
+        content, completion_tokens = await ollama_chat_compact(
+            model=model_name,
+            messages=msg_dicts,
+            max_tokens=max_tokens,
+        )
+        return content, completion_tokens
+
+    # ── Everyone else: litellm ───────────────────────────────────────
     prompt_messages = list(messages) + [Message(role="user", content=prompt)]
     llm_params = _resolve_llm_params(
         model_name,
@@ -498,19 +511,24 @@ class ContextManager:
             head.append(first_user_msg)
         self.items = head + [summarized_message] + recent_messages
 
-        # Count the actual post-compact context — system prompt + first user
-        # turn + summary + the preserved tail all contribute, not just the
-        # summary. litellm.token_counter uses the model's real tokenizer.
-        from litellm import token_counter
-
-        try:
-            self.running_context_usage = token_counter(
-                model=model_name,
-                messages=[m.model_dump() for m in self.items],
-            )
-        except Exception as e:
-            logger.warning("token_counter failed post-compact (%s); falling back to rough estimate", e)
-            self.running_context_usage = len(self.system_prompt) // 4 + completion_tokens
+        # Count tokens post-compact.
+        # Ollama models: use rough chars/4 estimate (no litellm tokenizer).
+        # Everyone else: litellm.token_counter uses the model's real tokenizer.
+        if model_name.startswith("ollama/"):
+            self.running_context_usage = sum(
+                len(str(m.get("content", ""))) for m in
+                [item.model_dump() for item in self.items]
+            ) // 4 + completion_tokens
+        else:
+            from litellm import token_counter
+            try:
+                self.running_context_usage = token_counter(
+                    model=model_name,
+                    messages=[m.model_dump() for m in self.items],
+                )
+            except Exception as e:
+                logger.warning("token_counter failed post-compact (%s); falling back to rough estimate", e)
+                self.running_context_usage = len(self.system_prompt) // 4 + completion_tokens
 
         tokens_after = self.running_context_usage
         messages_after = len(self.items)

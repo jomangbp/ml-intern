@@ -39,15 +39,17 @@ def load_model(checkpoint_path: str, device: torch.device, **kwargs) -> JEPA:
     sys.path.insert(0, str(Path(__file__).parent))
     from train_lewm import build_lewm
     
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get("config", {})
     
     # Override with kwargs
     img_size = kwargs.get("img_size", cfg.get("img_size", 128))
     embed_dim = kwargs.get("embed_dim", cfg.get("embed_dim", 192))
     ctx_len = kwargs.get("ctx_len", cfg.get("ctx_len", 3))
-    action_dim = kwargs.get("action_dim", 5)
+    action_dim = kwargs.get("action_dim", cfg.get("action_dim", 5))
     encoder_scale = kwargs.get("encoder_scale", cfg.get("encoder_scale", "tiny"))
+    predictor_depth = cfg.get("predictor_depth", cfg.get("depth", 6))
+    predictor_dropout = cfg.get("dropout", cfg.get("predictor_dropout", 0.1))
     
     model = build_lewm(
         img_size=img_size,
@@ -55,6 +57,8 @@ def load_model(checkpoint_path: str, device: torch.device, **kwargs) -> JEPA:
         history_size=ctx_len,
         action_dim=action_dim,
         encoder_scale=encoder_scale,
+        predictor_depth=predictor_depth,
+        predictor_dropout=predictor_dropout,
     )
     
     model.load_state_dict(ckpt["model_state_dict"])
@@ -204,38 +208,48 @@ def evaluate_on_dataset(
     model: JEPA,
     data_path: str,
     device: torch.device,
-    num_samples: int = 10,
+    num_samples: int = 20,
     img_size: int = 128,
 ):
-    """Evaluate latent planning on held-out trajectories."""
-    from train_lewm import HDF5GuiDataset
+    """Evaluate latent prediction on held-out trajectories."""
+    from train_lewm import EpisodeAwareGuiDataset
     
-    ds = HDF5GuiDataset(Path(data_path), context_len=3, img_size=img_size)
+    ds = EpisodeAwareGuiDataset(Path(data_path), context_len=3, img_size=img_size)
     
     print(f"\nEvaluating on {min(num_samples, len(ds))} samples...")
     
     pred_errors = []
-    for i in range(min(num_samples, len(ds))):
+    latent_norms = []
+    
+    indices = np.random.choice(len(ds), min(num_samples, len(ds)), replace=False)
+    
+    for i in indices:
         sample = ds[i]
         
-        # Current state
-        pixels_cur = sample["pixels"]  # (ctx_len, 3, H, W)
-        tgt_pixels = sample["tgt_pixels"]  # (1, 3, H, W)
+        pixels_cur = sample["pixels"]           # (ctx_len, 3, H, W)
+        tgt_pixels = sample["tgt_pixels"]       # (ctx_len, 3, H, W)
         
-        # Encode
+        # Encode last context frame and its target
         z_cur = encode_screenshot(model, pixels_cur[-1].unsqueeze(0), device)
-        z_goal = encode_screenshot(model, tgt_pixels.squeeze(0).unsqueeze(0), device)
+        z_goal = encode_screenshot(model, tgt_pixels[-1].unsqueeze(0), device)
         
-        # Direct prediction (no planning, just one step)
-        act = torch.zeros(1, 1, 5, device=device)  # zero action for 1-step
+        latent_norms.append(torch.norm(z_cur).item())
+        
+        # One-step prediction with zero action
+        act = torch.zeros(1, 1, ds.action_dim, device=device)
         z_pred = latent_rollout(model, z_cur, act, device)
         
         error = F.mse_loss(z_pred, z_goal).item()
         pred_errors.append(error)
     
     avg_error = np.mean(pred_errors)
-    print(f"  Average latent prediction error: {avg_error:.6f}")
+    std_error = np.std(pred_errors)
+    avg_norm = np.mean(latent_norms)
+    
+    print(f"  Average latent prediction error: {avg_error:.6f} ± {std_error:.6f}")
     print(f"  Min: {np.min(pred_errors):.6f}, Max: {np.max(pred_errors):.6f}")
+    print(f"  Average ||z||: {avg_norm:.3f}")
+    print(f"  Relative error (MSE / ||z||²): {avg_error / (avg_norm**2):.4f}")
     
     return avg_error
 

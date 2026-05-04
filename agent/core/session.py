@@ -30,6 +30,12 @@ def _get_max_tokens_safe(model_name: str) -> int:
     """
     from litellm import get_model_info
 
+    # ── Ollama models: litellm.get_model_info won't have entries ────
+    if model_name.startswith("ollama/"):
+        # Ollama cloud models. deepseek-v4-pro has ~1M context.
+        # Fall back to 1M for unknown Ollama models.
+        return 1_048_576
+
     candidates = [model_name]
     stripped = model_name.removeprefix("huggingface/").split(":", 1)[0]
     if stripped != model_name:

@@ -320,3 +320,60 @@ async def ollama_chat_non_streaming(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
+
+
+async def ollama_chat_compact(
+    model: str,
+    messages: list[dict],
+    *,
+    max_tokens: int = 2000,
+    temperature: float = 0.3,
+    timeout: float = 300.0,
+) -> tuple[str, int]:
+    """Simple chat for compaction/restore — returns (content, completion_tokens).
+
+    Does NOT use litellm or tool calls. Pure ollama /api/chat.
+    """
+    model_name = _extract_ollama_model(model)
+    api_base = _ollama_base_url()
+    url = f"{api_base}/api/chat"
+    body: dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        resp = await client.post(url, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+
+    message = data.get("message") or {}
+    content = message.get("content") or ""
+    completion_tokens = data.get("eval_count", 0)
+    return content, completion_tokens
+
+
+def _messages_to_dict_compact(messages) -> list[dict]:
+    """Convert litellm Message objects to plain dicts for compaction.
+
+    Strips litellm-only fields. No tool call conversion needed —
+    compaction summaries don't use tools.
+    """
+    result: list[dict] = []
+    for m in messages:
+        if hasattr(m, 'model_dump'):
+            d = m.model_dump(exclude_none=True)
+        elif isinstance(m, dict):
+            d = dict(m)
+        else:
+            d = {"role": getattr(m, "role", "user"), "content": str(m)}
+        # Strip fields Ollama doesn't accept
+        for key in ("function_call", "provider_specific_fields", "tool_calls", "tool_call_id", "name"):
+            d.pop(key, None)
+        result.append(d)
+    return result

@@ -31,38 +31,6 @@ logger = logging.getLogger(__name__)
 
 ToolCall = ChatCompletionMessageToolCall
 
-# ── litellm Ollama patch ──────────────────────────────────────────────
-# litellm's OllamaChatConfig.transform_request drops `name` / `tool_name`
-# from tool-result messages when converting OpenAI format → Ollama format.
-# Ollama needs `tool_name` on `role: "tool"` messages to match results to
-# tool calls.  We patch the transform to post-process and restore it.
-def _patch_litellm_ollama() -> None:
-    try:
-        from litellm.llms.ollama.chat.transformation import OllamaChatConfig
-    except Exception:
-        return  # litellm structure may differ in future versions
-
-    _orig_transform = OllamaChatConfig.transform_request
-
-    def _patched_transform(self, model, messages, optional_params, litellm_params, headers):
-        result = _orig_transform(self, model, messages, optional_params, litellm_params, headers)
-        ollama_messages = result.get("messages", [])
-        for i, m in enumerate(messages):
-            if isinstance(m, dict) and m.get("role") == "tool":
-                if i < len(ollama_messages):
-                    ollama_msg = ollama_messages[i]
-                    if not ollama_msg.get("tool_name"):
-                        if m.get("tool_name"):
-                            ollama_msg["tool_name"] = m["tool_name"]
-                        elif m.get("name"):
-                            ollama_msg["tool_name"] = m["name"]
-        return result
-
-    OllamaChatConfig.transform_request = _patched_transform  # type: ignore[method-assign]
-
-
-_patch_litellm_ollama()
-
 _MALFORMED_TOOL_PREFIX = "ERROR: Tool call to '"
 _MALFORMED_TOOL_SUFFIX = "' had malformed JSON arguments"
 
